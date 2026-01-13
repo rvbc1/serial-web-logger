@@ -1,0 +1,4 @@
+venv/
+*.log
+serial_web.out
+serial_logger.pid
