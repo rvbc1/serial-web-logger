@@ -108,6 +108,19 @@ def atomic_write_json(path: str, payload):
     os.replace(tmp_path, path)
 
 
+def remove_session_files(log_path: str | None):
+    if not log_path:
+        return
+
+    for path in (log_path, f"{log_path}.jsonl"):
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            continue
+
+
 def next_free_session_number_unlocked() -> int:
     used_numbers = set()
     for session in sessions.values():
@@ -479,6 +492,8 @@ def create_session(config: dict | None = None, persist: bool = True) -> SerialSe
 
 
 def delete_session(session_id: str):
+    global next_session_number
+
     with sessions_lock:
         session = sessions.pop(session_id, None)
         remaining_ids = list(sessions.keys())
@@ -487,10 +502,15 @@ def delete_session(session_id: str):
         return False, None
 
     session.stop_listening()
+    remove_session_files(session.log_path)
+
+    with sessions_lock:
+        next_session_number = next_free_session_number_unlocked()
 
     replacement_id = remaining_ids[0] if remaining_ids else None
     if replacement_id is None:
-        replacement = create_session(persist=False)
+        default_config = {"log_path": legacy_log_path} if legacy_log_path else {}
+        replacement = create_session(default_config, persist=False)
         replacement_id = replacement.id
 
     persist_sessions_metadata()

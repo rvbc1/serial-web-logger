@@ -15,6 +15,9 @@ make stop
 # Status
 make status
 
+# Clean logs + cache
+make clean
+
 # Logs
 tail -f logs/serial_web.out
 

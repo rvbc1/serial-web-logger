@@ -1,5 +1,7 @@
 -include .env
 
+.PHONY: all start stop status clean
+
 LOG_DIR := logs
 PID_FILE := $(LOG_DIR)/serial_logger.pid
 LEGACY_PID_FILE := serial_logger.pid
@@ -95,3 +97,11 @@ status:
 	else \
 		echo "Not running"; \
 	fi
+
+clean: stop
+	@mkdir -p "$(LOG_DIR)"
+	@find "$(LOG_DIR)" -mindepth 1 ! -name '.gitkeep' -exec rm -rf {} +
+	@rm -f "$(LEGACY_PID_FILE)"
+	@find . -type d \( -name '__pycache__' -o -name '.pytest_cache' -o -name '.mypy_cache' -o -name '.ruff_cache' \) -prune -exec rm -rf {} +
+	@find . -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
+	@echo "Cleaned logs and caches"
