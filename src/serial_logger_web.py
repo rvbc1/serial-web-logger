@@ -21,8 +21,8 @@ current_port = None
 current_baud = None
 log_path = None
 current_format = "string"
-desired_dtr = True
-desired_rts = True
+desired_dtr = False
+desired_rts = False
 
 # Przechowujemy ostatnie N wpisów do podglądu w WWW (plik rośnie normalnie na dysku)
 RING_MAX = 5000
@@ -264,8 +264,8 @@ INDEX_HTML = r"""
       </select>
     </label>
 
-    <label><input id="dtrCheckbox" type="checkbox" checked /> DTR</label>
-    <label><input id="rtsCheckbox" type="checkbox" checked /> RTS</label>
+    <label><input id="dtrCheckbox" type="checkbox" /> DTR</label>
+    <label><input id="rtsCheckbox" type="checkbox" /> RTS</label>
 
     <button id="startBtn">Start</button>
     <button id="stopBtn">Stop</button>
