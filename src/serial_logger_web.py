@@ -207,10 +207,36 @@ INDEX_HTML = r"""
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Serial Logger</title>
   <style>
-    body { font-family: system-ui, sans-serif; margin: 16px; }
+    :root {
+      color-scheme: light;
+      --panel-border: #cbd5e1;
+      --term-bg: #0f172a;
+      --term-fg: #e5eefc;
+      --term-muted: #94a3b8;
+    }
+    body { font-family: system-ui, sans-serif; margin: 16px; color: #0f172a; background: #f8fafc; }
     .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
     select, input, button { padding: 8px; font-size: 14px; }
-    #log { width: 100%; height: 70vh; white-space: pre; overflow: auto; padding: 12px; border: 1px solid #ccc; border-radius: 8px; background: #fafafa; }
+    #log {
+      width: 100%;
+      height: 70vh;
+      overflow: auto;
+      padding: 14px;
+      border: 1px solid var(--panel-border);
+      border-radius: 10px;
+      background: radial-gradient(circle at top, #172554 0%, var(--term-bg) 28%, #020617 100%);
+      color: var(--term-fg);
+      font: 13px/1.5 SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.05);
+    }
+    .log-line {
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .log-empty {
+      color: var(--term-muted);
+      font-style: italic;
+    }
     .badge { padding: 4px 8px; border-radius: 999px; font-size: 12px; }
     .on { background: #d1fae5; }
     .off { background: #fee2e2; }
@@ -255,6 +281,160 @@ INDEX_HTML = r"""
 <script>
 let lastId = 0;
 let polling = null;
+const ANSI_RE = /\x1b\[([0-9;]*)m/g;
+const ANSI_COLORS = [
+  "#1f2937", "#ef4444", "#22c55e", "#eab308",
+  "#60a5fa", "#c084fc", "#2dd4bf", "#e5e7eb",
+];
+const ANSI_BRIGHT_COLORS = [
+  "#94a3b8", "#f87171", "#4ade80", "#facc15",
+  "#93c5fd", "#d8b4fe", "#5eead4", "#ffffff",
+];
+
+function defaultAnsiState() {
+  return {
+    bold: false,
+    dim: false,
+    italic: false,
+    underline: false,
+    fg: null,
+    bg: null,
+  };
+}
+
+function ansi256ToCss(code) {
+  if (code < 0 || code > 255) return null;
+  if (code < 16) {
+    const palette = code < 8 ? ANSI_COLORS : ANSI_BRIGHT_COLORS;
+    return palette[code % 8];
+  }
+  if (code <= 231) {
+    const index = code - 16;
+    const levels = [0, 95, 135, 175, 215, 255];
+    const r = levels[Math.floor(index / 36) % 6];
+    const g = levels[Math.floor(index / 6) % 6];
+    const b = levels[index % 6];
+    return `rgb(${r}, ${g}, ${b})`;
+  }
+  const gray = 8 + (code - 232) * 10;
+  return `rgb(${gray}, ${gray}, ${gray})`;
+}
+
+function applyAnsiCodes(state, codes) {
+  if (codes.length === 0) codes = [0];
+  for (let i = 0; i < codes.length; i++) {
+    const code = codes[i];
+    if (Number.isNaN(code)) continue;
+    if (code === 0) {
+      Object.assign(state, defaultAnsiState());
+    } else if (code === 1) {
+      state.bold = true;
+    } else if (code === 2) {
+      state.dim = true;
+    } else if (code === 3) {
+      state.italic = true;
+    } else if (code === 4) {
+      state.underline = true;
+    } else if (code === 22) {
+      state.bold = false;
+      state.dim = false;
+    } else if (code === 23) {
+      state.italic = false;
+    } else if (code === 24) {
+      state.underline = false;
+    } else if (code >= 30 && code <= 37) {
+      state.fg = ANSI_COLORS[code - 30];
+    } else if (code === 39) {
+      state.fg = null;
+    } else if (code >= 40 && code <= 47) {
+      state.bg = ANSI_COLORS[code - 40];
+    } else if (code === 49) {
+      state.bg = null;
+    } else if (code >= 90 && code <= 97) {
+      state.fg = ANSI_BRIGHT_COLORS[code - 90];
+    } else if (code >= 100 && code <= 107) {
+      state.bg = ANSI_BRIGHT_COLORS[code - 100];
+    } else if (code === 38 || code === 48) {
+      const next = codes[i + 1];
+      if (next === 5 && Number.isInteger(codes[i + 2])) {
+        const color = ansi256ToCss(codes[i + 2]);
+        if (code === 38) state.fg = color;
+        else state.bg = color;
+        i += 2;
+      } else if (
+        next === 2 &&
+        Number.isInteger(codes[i + 2]) &&
+        Number.isInteger(codes[i + 3]) &&
+        Number.isInteger(codes[i + 4])
+      ) {
+        const r = codes[i + 2];
+        const g = codes[i + 3];
+        const b = codes[i + 4];
+        const color = `rgb(${r}, ${g}, ${b})`;
+        if (code === 38) state.fg = color;
+        else state.bg = color;
+        i += 4;
+      }
+    }
+  }
+}
+
+function buildStyledSpan(text, state) {
+  if (!text) return null;
+  const span = document.createElement("span");
+  span.textContent = text;
+  if (state.fg) span.style.color = state.fg;
+  if (state.bg) span.style.backgroundColor = state.bg;
+  if (state.bold) span.style.fontWeight = "700";
+  if (state.dim) span.style.opacity = "0.75";
+  if (state.italic) span.style.fontStyle = "italic";
+  if (state.underline) span.style.textDecoration = "underline";
+  return span;
+}
+
+function renderAnsiLine(line) {
+  const row = document.createElement("div");
+  row.className = "log-line";
+  const state = defaultAnsiState();
+  let lastIndex = 0;
+  let match = null;
+
+  while ((match = ANSI_RE.exec(line)) !== null) {
+    const text = line.slice(lastIndex, match.index);
+    const span = buildStyledSpan(text, state);
+    if (span) row.appendChild(span);
+
+    const codes = match[1]
+      ? match[1].split(";").map(value => Number.parseInt(value, 10))
+      : [];
+    applyAnsiCodes(state, codes);
+    lastIndex = match.index + match[0].length;
+  }
+
+  const tail = line.slice(lastIndex);
+  const tailSpan = buildStyledSpan(tail, state);
+  if (tailSpan) row.appendChild(tailSpan);
+  if (!row.childNodes.length) row.appendChild(document.createTextNode(""));
+  ANSI_RE.lastIndex = 0;
+  return row;
+}
+
+function setLogEmptyState() {
+  const el = document.getElementById("log");
+  if (el.childNodes.length) return;
+  const empty = document.createElement("div");
+  empty.className = "log-line log-empty";
+  empty.textContent = "Brak danych w podglądzie.";
+  el.appendChild(empty);
+}
+
+function clearLogEmptyState() {
+  const el = document.getElementById("log");
+  const first = el.firstElementChild;
+  if (first && first.classList.contains("log-empty")) {
+    first.remove();
+  }
+}
 
 function setStatus(running) {
   const b = document.getElementById("statusBadge");
@@ -300,9 +480,11 @@ function appendToLog(lines) {
   const atBottom = (el.scrollTop + el.clientHeight) >= (el.scrollHeight - 8);
 
   for (const l of lines) {
-    el.textContent += l + "\n";
+    clearLogEmptyState();
+    el.appendChild(renderAnsiLine(l));
   }
   if (atBottom) el.scrollTop = el.scrollHeight;
+  setLogEmptyState();
 }
 
 async function pollLog() {
@@ -366,11 +548,13 @@ document.getElementById("stopBtn").onclick = async () => {
 };
 
 document.getElementById("clearBtn").onclick = () => {
-  document.getElementById("log").textContent = "";
+  document.getElementById("log").replaceChildren();
+  setLogEmptyState();
   lastId = 0; // ponownie pobierze od początku bufora (jeśli chcesz inaczej, zmień)
 };
 
 (async function init(){
+  setLogEmptyState();
   await fetchPorts();
   await fetchStatus();
   startPolling();

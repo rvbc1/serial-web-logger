@@ -54,9 +54,9 @@ stop:
 	if [ -n "$$PID_FILE_TO_USE" ]; then \
 		PID=$$(cat "$$PID_FILE_TO_USE"); \
 		if ps -p $$PID -o args= 2>/dev/null | grep -q "$(PROC_MATCH)"; then \
-			CHILD=$$(ps -o pid= --ppid $$PID | tr -d ' '); \
-			if [ -n "$$CHILD" ]; then \
-				kill $$CHILD; \
+			CHILDREN=$$(pgrep -P $$PID 2>/dev/null || true); \
+			if [ -n "$$CHILDREN" ]; then \
+				kill $$CHILDREN 2>/dev/null || true; \
 			fi; \
 			kill $$PID; \
 			echo "Stopped (pid=$$PID)"; \
