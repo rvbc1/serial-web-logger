@@ -24,9 +24,9 @@ current_format = "string"
 desired_dtr = False
 desired_rts = False
 
-# Przechowujemy ostatnie N wpisów do podglądu w WWW (plik rośnie normalnie na dysku)
-RING_MAX = 5000
-ring = deque(maxlen=RING_MAX)  # elementy: (id, line)
+# Przechowujemy ostatnie N fragmentów strumienia do podglądu w WWW
+RING_MAX = 20000
+ring = deque(maxlen=RING_MAX)  # elementy: (id, chunk)
 next_id = 1
 
 
@@ -42,19 +42,37 @@ def list_serial_ports():
     return ports
 
 
-def append_line(line: str):
+def append_chunk(text: str):
     global next_id
+    if not text:
+        return
     with state_lock:
         _id = next_id
         next_id += 1
-        ring.append((_id, line))
+        ring.append((_id, text))
 
 
-def write_to_file(line: str):
-    # dopis do pliku (UTF-8)
+def write_to_file(text: str):
+    # dopis do pliku (UTF-8) bez modyfikowania strumienia
     with open(log_path, "a", encoding="utf-8", errors="replace") as f:
-        f.write(line + "\n")
+        f.write(text)
         f.flush()
+
+
+def log_file_event(level: str, message: str):
+    write_to_file(f"{now_ts()} [{level}] {message}\n")
+
+
+def log_terminal_event(level: str, message: str):
+    text = f"\r\n{now_ts()} [{level}] {message}\r\n"
+    append_chunk(text)
+    write_to_file(text)
+
+
+def format_serial_chunk(raw: bytes, fmt: str) -> str:
+    if fmt == "hex":
+        return " ".join(f"{b:02x}" for b in raw) + (" " if raw else "")
+    return raw.decode("utf-8", errors="replace")
 
 
 def format_signal_state(value: bool) -> str:
@@ -94,30 +112,36 @@ def update_control_lines(dtr_state: bool, rts_state: bool):
         desired_rts = rts_state
 
 
+def write_serial_input(text: str):
+    with state_lock:
+        serial_port = ser
+
+    if serial_port is None or not serial_port.is_open:
+        raise RuntimeError("Port szeregowy nie jest otwarty.")
+
+    payload = text.encode("utf-8", errors="replace")
+    serial_port.write(payload)
+    serial_port.flush()
+
+
 def read_loop():
     global ser
-    append_line(f"{now_ts()} [INFO] Start czytania z {current_port} @ {current_baud}")
-    write_to_file(f"{now_ts()} [INFO] Start czytania z {current_port} @ {current_baud}")
+    log_file_event("INFO", f"Start czytania z {current_port} @ {current_baud}")
 
     try:
         while not stop_event.is_set():
             try:
-                data = ser.readline()  # do \n lub timeout
+                waiting = ser.in_waiting
+                data = ser.read(waiting or 1)
                 if data:
                     raw = data.rstrip(b"\r\n")
                     with state_lock:
                         fmt = current_format
-                    if fmt == "hex":
-                        text = " ".join(f"{b:02x}" for b in raw)
-                    else:
-                        text = raw.decode("utf-8", errors="replace")
-                    line = f"{now_ts()} {text}"
-                    append_line(line)
-                    write_to_file(line)
+                    text = format_serial_chunk(raw if fmt == "hex" else data, fmt)
+                    append_chunk(text)
+                    write_to_file(text)
             except serial.SerialException as e:
-                line = f"{now_ts()} [ERROR] SerialException: {e}"
-                append_line(line)
-                write_to_file(line)
+                log_terminal_event("ERROR", f"SerialException: {e}")
                 break
     finally:
         try:
@@ -126,8 +150,7 @@ def read_loop():
         except Exception:
             pass
         ser = None
-        append_line(f"{now_ts()} [INFO] Stop czytania")
-        write_to_file(f"{now_ts()} [INFO] Stop czytania")
+        log_file_event("INFO", "Stop czytania")
 
 
 def start_listening(port: str, baud: int, dtr_state: bool, rts_state: bool):
@@ -146,7 +169,7 @@ def start_listening(port: str, baud: int, dtr_state: bool, rts_state: bool):
         new_ser = serial.Serial()
         new_ser.port = current_port
         new_ser.baudrate = current_baud
-        new_ser.timeout = 0.5  # żeby wątek mógł reagować na stop_event
+        new_ser.timeout = 0.1  # szybsza reakcja terminala i stop_event
         new_ser.rtscts = False
         new_ser.dsrdtr = False
         new_ser.dtr = dtr_state
@@ -156,13 +179,10 @@ def start_listening(port: str, baud: int, dtr_state: bool, rts_state: bool):
     except Exception as e:
         return False, f"Nie mogę otworzyć {port}: {e}"
 
-    append_line(
-        f"{now_ts()} [INFO] Port otwarty: {current_port} @ {current_baud} "
-        f"DTR={format_signal_state(dtr_state)} RTS={format_signal_state(rts_state)}"
-    )
-    write_to_file(
-        f"{now_ts()} [INFO] Port otwarty: {current_port} @ {current_baud} "
-        f"DTR={format_signal_state(dtr_state)} RTS={format_signal_state(rts_state)}"
+    log_file_event(
+        "INFO",
+        f"Port otwarty: {current_port} @ {current_baud} "
+        f"DTR={format_signal_state(dtr_state)} RTS={format_signal_state(rts_state)}",
     )
 
     reader_thread = threading.Thread(target=read_loop, daemon=True)
@@ -213,6 +233,7 @@ INDEX_HTML = r"""
       --term-bg: #0f172a;
       --term-fg: #e5eefc;
       --term-muted: #94a3b8;
+      --term-accent: #38bdf8;
     }
     body { font-family: system-ui, sans-serif; margin: 16px; color: #0f172a; background: #f8fafc; }
     .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
@@ -221,6 +242,7 @@ INDEX_HTML = r"""
       width: 100%;
       height: 70vh;
       overflow: auto;
+      box-sizing: border-box;
       padding: 14px;
       border: 1px solid var(--panel-border);
       border-radius: 10px;
@@ -228,14 +250,36 @@ INDEX_HTML = r"""
       color: var(--term-fg);
       font: 13px/1.5 SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
       box-shadow: inset 0 1px 0 rgba(255,255,255,0.05);
+      cursor: text;
+      outline: none;
+    }
+    #log.capture-active,
+    #log:focus {
+      border-color: var(--term-accent);
+      box-shadow:
+        0 0 0 1px rgba(56, 189, 248, 0.28),
+        inset 0 1px 0 rgba(255,255,255,0.05);
     }
     .log-line {
       white-space: pre-wrap;
       word-break: break-word;
+      min-height: 1.5em;
     }
     .log-empty {
       color: var(--term-muted);
       font-style: italic;
+    }
+    #terminalStatus {
+      margin: 8px 0 12px;
+      font-size: 13px;
+      color: var(--term-muted);
+    }
+    #terminalStatus.active {
+      color: #0369a1;
+      font-weight: 600;
+    }
+    #terminalStatus.error {
+      color: #b91c1c;
     }
     .badge { padding: 4px 8px; border-radius: 999px; font-size: 12px; }
     .on { background: #d1fae5; }
@@ -276,11 +320,24 @@ INDEX_HTML = r"""
     Podgląd pokazuje ostatnie wpisy (bufor w pamięci). Pełny log jest w pliku na serwerze.
   </p>
 
-  <div id="log"></div>
+  <p id="terminalStatus">Kliknij panel logu, aby przejąć klawiaturę i wysyłać znaki na UART.</p>
+  <div id="log" tabindex="0" role="textbox" aria-label="Log UART"></div>
 
 <script>
 let lastId = 0;
 let polling = null;
+let pollInFlight = false;
+let terminalFocused = false;
+let terminalRunning = false;
+let inputBuffer = "";
+let inputInFlight = false;
+let inputFlushTimer = null;
+let statusTimer = null;
+let statusFlash = null;
+let pendingEscape = "";
+let currentLineEl = null;
+let ansiState = null;
+
 const ANSI_RE = /\x1b\[([0-9;]*)m/g;
 const ANSI_COLORS = [
   "#1f2937", "#ef4444", "#22c55e", "#eab308",
@@ -300,6 +357,24 @@ function defaultAnsiState() {
     fg: null,
     bg: null,
   };
+}
+
+function initLogPanel() {
+  ansiState = defaultAnsiState();
+  const log = document.getElementById("log");
+  log.addEventListener("click", () => log.focus());
+  log.addEventListener("focus", () => {
+    terminalFocused = true;
+    renderTerminalStatus();
+  });
+  log.addEventListener("blur", () => {
+    terminalFocused = false;
+    renderTerminalStatus();
+  });
+  log.addEventListener("keydown", handleLogKeydown);
+  log.addEventListener("paste", handleLogPaste);
+  setLogEmptyState();
+  renderTerminalStatus();
 }
 
 function ansi256ToCss(code) {
@@ -367,10 +442,7 @@ function applyAnsiCodes(state, codes) {
         Number.isInteger(codes[i + 3]) &&
         Number.isInteger(codes[i + 4])
       ) {
-        const r = codes[i + 2];
-        const g = codes[i + 3];
-        const b = codes[i + 4];
-        const color = `rgb(${r}, ${g}, ${b})`;
+        const color = `rgb(${codes[i + 2]}, ${codes[i + 3]}, ${codes[i + 4]})`;
         if (code === 38) state.fg = color;
         else state.bg = color;
         i += 4;
@@ -379,64 +451,45 @@ function applyAnsiCodes(state, codes) {
   }
 }
 
-function buildStyledSpan(text, state) {
-  if (!text) return null;
-  const span = document.createElement("span");
-  span.textContent = text;
-  if (state.fg) span.style.color = state.fg;
-  if (state.bg) span.style.backgroundColor = state.bg;
-  if (state.bold) span.style.fontWeight = "700";
-  if (state.dim) span.style.opacity = "0.75";
-  if (state.italic) span.style.fontStyle = "italic";
-  if (state.underline) span.style.textDecoration = "underline";
-  return span;
+function flashTerminalStatus(message, variant = "error") {
+  statusFlash = {message, variant};
+  renderTerminalStatus();
+  if (statusTimer) clearTimeout(statusTimer);
+  statusTimer = setTimeout(() => {
+    statusFlash = null;
+    renderTerminalStatus();
+  }, 2200);
 }
 
-function renderAnsiLine(line) {
-  const row = document.createElement("div");
-  row.className = "log-line";
-  const state = defaultAnsiState();
-  let lastIndex = 0;
-  let match = null;
+function renderTerminalStatus() {
+  const el = document.getElementById("terminalStatus");
+  const log = document.getElementById("log");
+  log.classList.toggle("capture-active", terminalFocused);
 
-  while ((match = ANSI_RE.exec(line)) !== null) {
-    const text = line.slice(lastIndex, match.index);
-    const span = buildStyledSpan(text, state);
-    if (span) row.appendChild(span);
-
-    const codes = match[1]
-      ? match[1].split(";").map(value => Number.parseInt(value, 10))
-      : [];
-    applyAnsiCodes(state, codes);
-    lastIndex = match.index + match[0].length;
+  if (statusFlash) {
+    el.textContent = statusFlash.message;
+    el.className = statusFlash.variant;
+    return;
   }
 
-  const tail = line.slice(lastIndex);
-  const tailSpan = buildStyledSpan(tail, state);
-  if (tailSpan) row.appendChild(tailSpan);
-  if (!row.childNodes.length) row.appendChild(document.createTextNode(""));
-  ANSI_RE.lastIndex = 0;
-  return row;
-}
-
-function setLogEmptyState() {
-  const el = document.getElementById("log");
-  if (el.childNodes.length) return;
-  const empty = document.createElement("div");
-  empty.className = "log-line log-empty";
-  empty.textContent = "Brak danych w podglądzie.";
-  el.appendChild(empty);
-}
-
-function clearLogEmptyState() {
-  const el = document.getElementById("log");
-  const first = el.firstElementChild;
-  if (first && first.classList.contains("log-empty")) {
-    first.remove();
+  if (!terminalRunning) {
+    el.textContent = "Port zamknięty. Kliknij Start, a potem panel logu, żeby wysyłać klawisze na UART.";
+    el.className = "";
+    return;
   }
+
+  if (terminalFocused) {
+    el.textContent = "Klawiatura aktywna: wpisy trafiają bezpośrednio na UART.";
+    el.className = "active";
+    return;
+  }
+
+  el.textContent = "Kliknij panel logu, aby przejąć klawiaturę i wysyłać znaki na UART.";
+  el.className = "";
 }
 
 function setStatus(running) {
+  terminalRunning = !!running;
   const b = document.getElementById("statusBadge");
   if (running) {
     b.textContent = "RUN";
@@ -445,6 +498,7 @@ function setStatus(running) {
     b.textContent = "STOP";
     b.classList.remove("on"); b.classList.add("off");
   }
+  renderTerminalStatus();
 }
 
 async function fetchPorts() {
@@ -475,30 +529,197 @@ async function fetchStatus() {
   document.getElementById("rtsCheckbox").checked = !!data.rts;
 }
 
-function appendToLog(lines) {
-  const el = document.getElementById("log");
-  const atBottom = (el.scrollTop + el.clientHeight) >= (el.scrollHeight - 8);
+function setLogEmptyState() {
+  const log = document.getElementById("log");
+  if (log.childNodes.length) return;
+  const empty = document.createElement("div");
+  empty.className = "log-line log-empty";
+  empty.textContent = "Brak danych w podglądzie.";
+  log.appendChild(empty);
+}
 
-  for (const l of lines) {
-    clearLogEmptyState();
-    el.appendChild(renderAnsiLine(l));
+function clearLogEmptyState() {
+  const log = document.getElementById("log");
+  const first = log.firstElementChild;
+  if (first && first.classList.contains("log-empty")) {
+    first.remove();
   }
-  if (atBottom) el.scrollTop = el.scrollHeight;
-  setLogEmptyState();
+}
+
+function ensureCurrentLine() {
+  if (currentLineEl) return currentLineEl;
+  const line = document.createElement("div");
+  line.className = "log-line";
+  document.getElementById("log").appendChild(line);
+  currentLineEl = line;
+  return line;
+}
+
+function buildStyledSpan(text) {
+  if (!text) return null;
+  const span = document.createElement("span");
+  span.textContent = text;
+  if (ansiState.fg) span.style.color = ansiState.fg;
+  if (ansiState.bg) span.style.backgroundColor = ansiState.bg;
+  if (ansiState.bold) span.style.fontWeight = "700";
+  if (ansiState.dim) span.style.opacity = "0.75";
+  if (ansiState.italic) span.style.fontStyle = "italic";
+  if (ansiState.underline) span.style.textDecoration = "underline";
+  return span;
+}
+
+function appendStyledText(text) {
+  if (!text) return;
+  clearLogEmptyState();
+  const span = buildStyledSpan(text);
+  if (span) ensureCurrentLine().appendChild(span);
+}
+
+function appendNewLine() {
+  clearLogEmptyState();
+  if (!currentLineEl) {
+    ensureCurrentLine();
+  }
+  currentLineEl = null;
+}
+
+function removeLastRenderedChar() {
+  if (!currentLineEl) return;
+  while (currentLineEl.lastChild) {
+    const node = currentLineEl.lastChild;
+    if (node.nodeType === Node.TEXT_NODE) {
+      if (node.textContent.length > 1) {
+        node.textContent = node.textContent.slice(0, -1);
+        return;
+      }
+      currentLineEl.removeChild(node);
+      continue;
+    }
+    if (node.textContent.length > 1) {
+      node.textContent = node.textContent.slice(0, -1);
+      return;
+    }
+    currentLineEl.removeChild(node);
+  }
+}
+
+function consumeEscapeSequence(buffer, startIndex) {
+  if (startIndex + 1 >= buffer.length) {
+    return {complete: false};
+  }
+
+  const next = buffer[startIndex + 1];
+  if (next === "[") {
+    for (let i = startIndex + 2; i < buffer.length; i++) {
+      const ch = buffer[i];
+      if (ch >= "@" && ch <= "~") {
+        if (ch === "m") {
+          const payload = buffer.slice(startIndex + 2, i);
+          const codes = payload ? payload.split(";").map(value => Number.parseInt(value, 10)) : [];
+          return {complete: true, nextIndex: i + 1, kind: "sgr", codes};
+        }
+        return {complete: true, nextIndex: i + 1, kind: "ignore"};
+      }
+    }
+    return {complete: false};
+  }
+
+  if (next === "]") {
+    for (let i = startIndex + 2; i < buffer.length; i++) {
+      if (buffer[i] === "\x07") {
+        return {complete: true, nextIndex: i + 1, kind: "ignore"};
+      }
+      if (buffer[i] === "\x1b" && buffer[i + 1] === "\\") {
+        return {complete: true, nextIndex: i + 2, kind: "ignore"};
+      }
+    }
+    return {complete: false};
+  }
+
+  return {complete: true, nextIndex: startIndex + 2, kind: "ignore"};
+}
+
+function appendChunkToLog(chunk) {
+  let input = pendingEscape + chunk;
+  pendingEscape = "";
+  let textStart = 0;
+
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i];
+
+    if (ch === "\x1b") {
+      appendStyledText(input.slice(textStart, i));
+      const seq = consumeEscapeSequence(input, i);
+      if (!seq.complete) {
+        pendingEscape = input.slice(i);
+        return;
+      }
+      if (seq.kind === "sgr") {
+        applyAnsiCodes(ansiState, seq.codes);
+      }
+      i = seq.nextIndex - 1;
+      textStart = seq.nextIndex;
+      continue;
+    }
+
+    if (ch === "\r") {
+      appendStyledText(input.slice(textStart, i));
+      if (input[i + 1] === "\n") {
+        i += 1;
+      }
+      appendNewLine();
+      textStart = i + 1;
+      continue;
+    }
+
+    if (ch === "\n") {
+      appendStyledText(input.slice(textStart, i));
+      appendNewLine();
+      textStart = i + 1;
+      continue;
+    }
+
+    if (ch === "\b") {
+      appendStyledText(input.slice(textStart, i));
+      removeLastRenderedChar();
+      textStart = i + 1;
+    }
+  }
+
+  appendStyledText(input.slice(textStart));
+}
+
+function appendToLog(chunks) {
+  const log = document.getElementById("log");
+  const atBottom = (log.scrollTop + log.clientHeight) >= (log.scrollHeight - 8);
+  for (const chunk of chunks) {
+    appendChunkToLog(chunk);
+  }
+  if (atBottom) {
+    log.scrollTop = log.scrollHeight;
+  }
 }
 
 async function pollLog() {
-  const res = await fetch(`/api/log?since=${lastId}`);
-  const data = await res.json();
-  if (data.lines && data.lines.length) {
-    appendToLog(data.lines.map(x => x.line));
-    lastId = data.to_id;
+  if (pollInFlight) return;
+  pollInFlight = true;
+  try {
+    const res = await fetch(`/api/log?since=${lastId}`);
+    const data = await res.json();
+    if (data.chunks && data.chunks.length) {
+      appendToLog(data.chunks.map(x => x.text));
+      lastId = data.to_id;
+    } else if (typeof data.to_id === "number") {
+      lastId = data.to_id;
+    }
+  } finally {
+    pollInFlight = false;
   }
 }
 
 function startPolling() {
   if (polling) return;
-  polling = setInterval(pollLog, 700);
+  polling = setInterval(pollLog, 100);
 }
 
 function stopPolling() {
@@ -520,6 +741,112 @@ async function pushControlLines() {
     return;
   }
   setStatus(data.running);
+}
+
+function queueTerminalInput(data) {
+  if (!terminalRunning) {
+    flashTerminalStatus("Port nie jest otwarty.");
+    return;
+  }
+  inputBuffer += data;
+  if (inputFlushTimer) return;
+  inputFlushTimer = setTimeout(() => {
+    inputFlushTimer = null;
+    flushTerminalInput();
+  }, 10);
+}
+
+function encodeCtrlKey(key) {
+  if (key === " ") return "\x00";
+  if (key.length !== 1) return null;
+  const code = key.toUpperCase().charCodeAt(0);
+  if (code >= 64 && code <= 95) {
+    return String.fromCharCode(code - 64);
+  }
+  return null;
+}
+
+function encodeKeyEvent(event) {
+  if (event.metaKey) return null;
+
+  const special = {
+    Enter: "\r",
+    Backspace: "\x7f",
+    Tab: "\t",
+    Escape: "\x1b",
+    ArrowUp: "\x1b[A",
+    ArrowDown: "\x1b[B",
+    ArrowRight: "\x1b[C",
+    ArrowLeft: "\x1b[D",
+    Home: "\x1b[H",
+    End: "\x1b[F",
+    Delete: "\x1b[3~",
+    PageUp: "\x1b[5~",
+    PageDown: "\x1b[6~",
+    Insert: "\x1b[2~",
+  };
+
+  if (event.ctrlKey) {
+    const encoded = encodeCtrlKey(event.key);
+    if (encoded !== null) return encoded;
+    if (special[event.key]) return special[event.key];
+    return null;
+  }
+
+  if (event.altKey) {
+    if (special[event.key]) return "\x1b" + special[event.key];
+    if (event.key.length === 1) return "\x1b" + event.key;
+    return null;
+  }
+
+  if (special[event.key]) return special[event.key];
+  if (event.key.length === 1) return event.key;
+  return null;
+}
+
+function handleLogKeydown(event) {
+  const text = encodeKeyEvent(event);
+  if (text === null) return;
+  event.preventDefault();
+  queueTerminalInput(text);
+}
+
+function handleLogPaste(event) {
+  const text = event.clipboardData ? event.clipboardData.getData("text/plain") : "";
+  if (!text) return;
+  event.preventDefault();
+  queueTerminalInput(text.replace(/\n/g, "\r"));
+}
+
+async function flushTerminalInput() {
+  if (inputInFlight || !inputBuffer) return;
+  inputInFlight = true;
+  const payload = inputBuffer;
+  inputBuffer = "";
+
+  try {
+    const res = await fetch("/api/input", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({text: payload})
+    });
+    const data = await res.json();
+    if (!res.ok || !data.ok) {
+      throw new Error(data.error || "Błąd wysyłania na UART");
+    }
+    if (typeof data.running === "boolean") {
+      setStatus(data.running);
+    }
+  } catch (err) {
+    inputBuffer = payload + inputBuffer;
+    flashTerminalStatus(err.message || "Błąd wysyłania na UART");
+    await fetchStatus();
+  } finally {
+    inputInFlight = false;
+    if (inputBuffer) {
+      flushTerminalInput();
+    }
+  }
 }
 
 document.getElementById("refreshPorts").onclick = fetchPorts;
@@ -549,12 +876,15 @@ document.getElementById("stopBtn").onclick = async () => {
 
 document.getElementById("clearBtn").onclick = () => {
   document.getElementById("log").replaceChildren();
+  lastId = 0;
+  pendingEscape = "";
+  currentLineEl = null;
+  ansiState = defaultAnsiState();
   setLogEmptyState();
-  lastId = 0; // ponownie pobierze od początku bufora (jeśli chcesz inaczej, zmień)
 };
 
 (async function init(){
-  setLogEmptyState();
+  initLogPanel();
   await fetchPorts();
   await fetchStatus();
   startPolling();
@@ -656,13 +986,10 @@ def api_control_lines():
         return jsonify({"ok": False, "error": f"Nie mogę ustawić DTR/RTS: {e}"}), 500
 
     target = "na otwartym porcie" if is_running() else "dla następnego otwarcia portu"
-    append_line(
-        f"{now_ts()} [INFO] Ustawiono DTR={format_signal_state(dtr_state)} "
-        f"RTS={format_signal_state(rts_state)} {target}"
-    )
-    write_to_file(
-        f"{now_ts()} [INFO] Ustawiono DTR={format_signal_state(dtr_state)} "
-        f"RTS={format_signal_state(rts_state)} {target}"
+    log_file_event(
+        "INFO",
+        f"Ustawiono DTR={format_signal_state(dtr_state)} "
+        f"RTS={format_signal_state(rts_state)} {target}",
     )
 
     return jsonify({
@@ -673,22 +1000,40 @@ def api_control_lines():
     })
 
 
+@app.post("/api/input")
+def api_input():
+    data = request.get_json(force=True, silent=True) or {}
+    text = data.get("text")
+
+    if not isinstance(text, str):
+        return jsonify({"ok": False, "error": "Pole text musi być typu string."}), 400
+    if not text:
+        return jsonify({"ok": True, "running": is_running()})
+
+    try:
+        write_serial_input(text)
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"Nie mogę wysłać danych na UART: {e}"}), 500
+
+    return jsonify({"ok": True, "running": is_running()})
+
+
 @app.get("/api/log")
 def api_log():
-    # Zwraca linie o id > since (inkrementalne odświeżanie)
+    # Zwraca fragmenty tekstu o id > since (inkrementalne odświeżanie)
     try:
         since = int(request.args.get("since", "0"))
     except ValueError:
         since = 0
 
     with state_lock:
-        items = [(i, l) for (i, l) in ring if i > since]
+        items = [(i, chunk) for (i, chunk) in ring if i > since]
         to_id = ring[-1][0] if ring else since
 
     return jsonify({
         "from_id": since,
         "to_id": to_id,
-        "lines": [{"id": i, "line": l} for (i, l) in items],
+        "chunks": [{"id": i, "text": text} for (i, text) in items],
     })
 
 
@@ -705,8 +1050,7 @@ def main():
     if log_dir:
         os.makedirs(log_dir, exist_ok=True)
     # dopisz informację startową
-    append_line(f"{now_ts()} [INFO] Serwer WWW start: http://{args.host}:{args.port}  logfile={log_path}")
-    write_to_file(f"{now_ts()} [INFO] Serwer WWW start: http://{args.host}:{args.port}  logfile={log_path}")
+    log_file_event("INFO", f"Serwer WWW start: http://{args.host}:{args.port}  logfile={log_path}")
 
     app.run(host=args.host, port=args.port, debug=False, threaded=True)
 
