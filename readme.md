@@ -19,6 +19,9 @@ make status
 tail -f logs/serial_web.out
 
 # UART terminal
+- jedna karta = jedna niezależna sesja UART
+- można dodawać i usuwać karty z poziomu WWW
+- każda karta ma własny port, baud, format, DTR/RTS, podgląd i plik logu
 - ustaw `Format` na `string`
 - kliknij w panel logu w przeglądarce
 - wpisywane klawisze są wysyłane na UART
@@ -28,3 +31,5 @@ tail -f logs/serial_web.out
 # Structure
 - `src/` - kod aplikacji
 - `logs/` - logi runtime i PID
+- `logs/session_store.json` - zapis konfiguracji kart/sesji
+- `logs/sessions/` - osobne logi dla dodatkowych sesji
