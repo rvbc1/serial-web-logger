@@ -112,13 +112,25 @@ def remove_session_files(log_path: str | None):
     if not log_path:
         return
 
-    for path in (log_path, f"{log_path}.jsonl"):
+    for path in (log_path, f"{log_path}.jsonl", f"{log_path}.raw"):
         try:
             os.remove(path)
         except FileNotFoundError:
             continue
         except OSError:
             continue
+
+
+def iter_file_chunks(path: str, chunk_size: int = 65536):
+    if not os.path.exists(path):
+        return
+
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            yield chunk
 
 
 def next_free_session_number_unlocked() -> int:
@@ -156,12 +168,13 @@ class SerialSession:
         default_log_path = os.path.join(session_logs_dir, f"{self.id}.log")
         self.log_path = config.get("log_path") or default_log_path
         self.structured_log_path = self.log_path + ".jsonl"
+        self.raw_log_path = self.log_path + ".raw"
+        self.use_structured_log = os.path.exists(self.structured_log_path)
 
         os.makedirs(os.path.dirname(self.log_path) or ".", exist_ok=True)
         self.ring = deque(maxlen=RING_MAX)  # elementy: (id, ts, source, text)
         self.next_id = 1
         self.plain_log_state = {"at_line_start": infer_plain_log_line_start(self.log_path)}
-        self.bootstrap_structured_log()
 
     def export_config(self) -> dict:
         with self.state_lock:
@@ -207,7 +220,6 @@ class SerialSession:
         if not text:
             return
 
-        record = {"ts": ts, "source": source, "text": text}
         plain_text = format_text_with_timestamps(text, ts, self.plain_log_state)
 
         with self.log_io_lock:
@@ -215,9 +227,15 @@ class SerialSession:
                 plain_file.write(plain_text)
                 plain_file.flush()
 
-            with open(self.structured_log_path, "a", encoding="utf-8", errors="replace") as jsonl_file:
-                jsonl_file.write(json.dumps(record, ensure_ascii=False) + "\n")
-                jsonl_file.flush()
+            if self.use_structured_log:
+                record = {"ts": ts, "source": source, "text": text}
+                with open(self.structured_log_path, "a", encoding="utf-8", errors="replace") as jsonl_file:
+                    jsonl_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    jsonl_file.flush()
+            else:
+                with open(self.raw_log_path, "a", encoding="utf-8", errors="replace") as raw_file:
+                    raw_file.write(text)
+                    raw_file.flush()
 
     def append_record(
         self,
@@ -251,27 +269,6 @@ class SerialSession:
             include_in_buffer=True,
         )
 
-    def bootstrap_structured_log(self):
-        if os.path.exists(self.structured_log_path):
-            return
-
-        if not os.path.exists(self.log_path) or os.path.getsize(self.log_path) == 0:
-            open(self.structured_log_path, "a", encoding="utf-8").close()
-            return
-
-        with open(self.log_path, "r", encoding="utf-8", errors="replace") as src, open(
-            self.structured_log_path, "w", encoding="utf-8", errors="replace"
-        ) as dst:
-            legacy_text = src.read()
-            if legacy_text:
-                dst.write(
-                    json.dumps(
-                        {"ts": None, "source": "legacy", "text": legacy_text},
-                        ensure_ascii=False,
-                    )
-                    + "\n"
-                )
-
     def iter_structured_records(self):
         if not os.path.exists(self.structured_log_path):
             return
@@ -299,13 +296,16 @@ class SerialSession:
                 yield {"ts": ts, "source": source, "text": text}
 
     def iter_download_text(self, include_timestamps: bool):
-        state = {"at_line_start": True}
+        if include_timestamps:
+            yield from iter_file_chunks(self.log_path)
+            return
+
+        if not self.use_structured_log:
+            yield from iter_file_chunks(self.raw_log_path)
+            return
+
         for record in self.iter_structured_records() or ():
-            text = record["text"]
-            if include_timestamps:
-                yield format_text_with_timestamps(text, record["ts"], state)
-            else:
-                yield text
+            yield record["text"]
 
     def update_control_lines(self, dtr_state: bool, rts_state: bool):
         with self.state_lock:
@@ -338,10 +338,13 @@ class SerialSession:
                 self.ring.clear()
                 self.next_id = 1
                 self.plain_log_state = {"at_line_start": True}
+                self.use_structured_log = False
 
             os.makedirs(os.path.dirname(self.log_path) or ".", exist_ok=True)
             open(self.log_path, "w", encoding="utf-8").close()
-            open(self.structured_log_path, "w", encoding="utf-8").close()
+            open(self.raw_log_path, "w", encoding="utf-8").close()
+            if os.path.exists(self.structured_log_path):
+                open(self.structured_log_path, "w", encoding="utf-8").close()
 
     def write_serial_input(self, text: str):
         with self.state_lock:
