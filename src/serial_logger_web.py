@@ -710,8 +710,6 @@ INDEX_HTML = r"""
 
   <div class="sessions-row">
     <div id="sessionTabs"></div>
-    <button id="addSessionBtn">Nowa sesja</button>
-    <button id="removeSessionBtn">Usuń sesję</button>
   </div>
 
   <div class="row session-name-row">
@@ -719,6 +717,8 @@ INDEX_HTML = r"""
       <input id="sessionNameInput" type="text" maxlength="80" placeholder="np. RPi UART" />
     </label>
     <button id="renameSessionBtn">Zapisz nazwę</button>
+    <button id="addSessionBtn">Nowa sesja</button>
+    <button id="removeSessionBtn">Usuń sesję</button>
   </div>
 
   <div class="row">
@@ -747,8 +747,6 @@ INDEX_HTML = r"""
     <button id="startBtn">Start</button>
     <button id="stopBtn">Stop</button>
     <button id="clearBtn">Wyczyść podgląd</button>
-    <button id="downloadLogBtn">Pobierz log</button>
-    <button id="downloadLogWithTsBtn">Pobierz log + czasy</button>
   </div>
 
   <p style="margin-top: 8px; color:#666;">
@@ -757,6 +755,10 @@ INDEX_HTML = r"""
 
   <p id="terminalStatus">Kliknij panel logu, aby przejąć klawiaturę i wysyłać znaki na UART.</p>
   <div id="log" tabindex="0" role="textbox" aria-label="Log UART"></div>
+  <div class="row" style="margin-top: 12px;">
+    <button id="downloadLogBtn">Pobierz log</button>
+    <button id="downloadLogWithTsBtn">Pobierz log + czasy</button>
+  </div>
 
 <script>
 let sessionSummaries = [];
