@@ -1,4 +1,6 @@
 venv/
+logs/*
+!logs/.gitkeep
 *.log
 serial_web.out
 serial_logger.pid

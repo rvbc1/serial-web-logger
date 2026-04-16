@@ -11,4 +11,8 @@ make stop
 make status
 
 # Logs
-tail -f serial_web.out
+tail -f logs/serial_web.out
+
+# Structure
+- `src/` - kod aplikacji
+- `logs/` - logi runtime i PID

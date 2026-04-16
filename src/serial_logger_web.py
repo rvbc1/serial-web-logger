@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 import argparse
-import json
+import os
 import threading
-import time
 from collections import deque
 from datetime import datetime
 
@@ -514,10 +513,13 @@ def main():
     parser = argparse.ArgumentParser(description="Serial logger + prosta strona WWW")
     parser.add_argument("--host", default="127.0.0.1", help="adres nasłuchu (np. 0.0.0.0)")
     parser.add_argument("--port", type=int, default=8080, help="port HTTP")
-    parser.add_argument("--logfile", default="serial.log", help="plik logu")
+    parser.add_argument("--logfile", default="logs/serial.log", help="plik logu")
     args = parser.parse_args()
 
     log_path = args.logfile
+    log_dir = os.path.dirname(log_path)
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
     # dopisz informację startową
     append_line(f"{now_ts()} [INFO] Serwer WWW start: http://{args.host}:{args.port}  logfile={log_path}")
     write_to_file(f"{now_ts()} [INFO] Serwer WWW start: http://{args.host}:{args.port}  logfile={log_path}")
