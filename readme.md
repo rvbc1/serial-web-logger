@@ -4,6 +4,11 @@ sudo usermod -a -G dialout $USER
 # Run
 make start
 
+# Port override
+echo 'PORT=7499' > .env
+# albo jednorazowo:
+PORT=7499 make start
+
 # Stop
 make stop
 

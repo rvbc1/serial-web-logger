@@ -6,9 +6,16 @@ BASE_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 VENV_DIR="$BASE_DIR/venv"
 LOG_DIR="$BASE_DIR/logs"
 APP_PATH="$BASE_DIR/src/serial_logger_web.py"
+ENV_FILE="$BASE_DIR/.env"
 
 mkdir -p "$LOG_DIR"
 cd "$BASE_DIR"
+
+if [ -f "$ENV_FILE" ]; then
+    set -a
+    source "$ENV_FILE"
+    set +a
+fi
 
 # 1. Utworz wirtualne srodowisko jesli nie istnieje
 if [ ! -d "$VENV_DIR" ]; then
