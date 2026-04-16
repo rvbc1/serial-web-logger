@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 import argparse
+import json
 import os
 import threading
 from collections import deque
 from datetime import datetime
 
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, Response, stream_with_context
 import serial
 from serial.tools import list_ports
 
@@ -20,14 +21,17 @@ ser = None
 current_port = None
 current_baud = None
 log_path = None
+structured_log_path = None
 current_format = "string"
 desired_dtr = False
 desired_rts = False
 
-# Przechowujemy ostatnie N fragmentów strumienia do podglądu w WWW
+# Przechowujemy ostatnie N rekordów do podglądu w WWW
 RING_MAX = 20000
-ring = deque(maxlen=RING_MAX)  # elementy: (id, chunk)
+ring = deque(maxlen=RING_MAX)  # elementy: (id, ts, source, text)
 next_id = 1
+log_io_lock = threading.Lock()
+plain_log_state = {"at_line_start": True}
 
 
 def now_ts():
@@ -42,31 +46,164 @@ def list_serial_ports():
     return ports
 
 
-def append_chunk(text: str):
+def append_buffer_record(ts: str | None, source: str, text: str):
     global next_id
     if not text:
         return
     with state_lock:
         _id = next_id
         next_id += 1
-        ring.append((_id, text))
+        ring.append((_id, ts, source, text))
 
 
-def write_to_file(text: str):
-    # dopis do pliku (UTF-8) bez modyfikowania strumienia
-    with open(log_path, "a", encoding="utf-8", errors="replace") as f:
-        f.write(text)
-        f.flush()
+def format_text_with_timestamps(text: str, ts: str | None, state: dict) -> str:
+    if not text:
+        return ""
+
+    prefix = f"{ts} " if ts else ""
+    out = []
+    i = 0
+    while i < len(text):
+        if state["at_line_start"] and prefix:
+            out.append(prefix)
+            state["at_line_start"] = False
+
+        ch = text[i]
+        if ch == "\r":
+            out.append("\r")
+            if i + 1 < len(text) and text[i + 1] == "\n":
+                out.append("\n")
+                i += 1
+            state["at_line_start"] = True
+        elif ch == "\n":
+            out.append("\n")
+            state["at_line_start"] = True
+        else:
+            out.append(ch)
+        i += 1
+
+    return "".join(out)
+
+
+def write_log_files(ts: str | None, source: str, text: str):
+    if not text:
+        return
+
+    record = {"ts": ts, "source": source, "text": text}
+    plain_text = format_text_with_timestamps(text, ts, plain_log_state)
+
+    with log_io_lock:
+        with open(log_path, "a", encoding="utf-8", errors="replace") as plain_file:
+            plain_file.write(plain_text)
+            plain_file.flush()
+
+        with open(structured_log_path, "a", encoding="utf-8", errors="replace") as structured_file:
+            structured_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+            structured_file.flush()
+
+
+def append_record(
+    text: str,
+    *,
+    ts: str | None = None,
+    source: str = "serial",
+    include_in_buffer: bool = True,
+):
+    if not text:
+        return
+
+    ts = ts or now_ts()
+    if include_in_buffer:
+        append_buffer_record(ts, source, text)
+    write_log_files(ts, source, text)
 
 
 def log_file_event(level: str, message: str):
-    write_to_file(f"{now_ts()} [{level}] {message}\n")
+    append_record(
+        f"[{level}] {message}\n",
+        ts=now_ts(),
+        source="event",
+        include_in_buffer=False,
+    )
 
 
 def log_terminal_event(level: str, message: str):
-    text = f"\r\n{now_ts()} [{level}] {message}\r\n"
-    append_chunk(text)
-    write_to_file(text)
+    append_record(
+        f"[{level}] {message}\n",
+        ts=now_ts(),
+        source="event",
+        include_in_buffer=True,
+    )
+
+
+def infer_plain_log_line_start(path: str) -> bool:
+    try:
+        if not os.path.exists(path) or os.path.getsize(path) == 0:
+            return True
+        with open(path, "rb") as f:
+            f.seek(-1, os.SEEK_END)
+            return f.read(1) in (b"\n", b"\r")
+    except OSError:
+        return True
+
+
+def bootstrap_structured_log():
+    if os.path.exists(structured_log_path):
+        return
+
+    if not os.path.exists(log_path) or os.path.getsize(log_path) == 0:
+        open(structured_log_path, "a", encoding="utf-8").close()
+        return
+
+    with open(log_path, "r", encoding="utf-8", errors="replace") as src, open(
+        structured_log_path, "w", encoding="utf-8", errors="replace"
+    ) as dst:
+        legacy_text = src.read()
+        if legacy_text:
+            dst.write(
+                json.dumps(
+                    {"ts": None, "source": "legacy", "text": legacy_text},
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+
+
+def iter_structured_records():
+    if not structured_log_path or not os.path.exists(structured_log_path):
+        return
+
+    with open(structured_log_path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(record, dict):
+                continue
+            text = record.get("text")
+            if not isinstance(text, str):
+                continue
+            ts = record.get("ts")
+            if ts is not None and not isinstance(ts, str):
+                ts = None
+            source = record.get("source")
+            if not isinstance(source, str):
+                source = "serial"
+            yield {"ts": ts, "source": source, "text": text}
+
+
+def iter_download_text(include_timestamps: bool):
+    state = {"at_line_start": True}
+    for record in iter_structured_records() or ():
+        text = record["text"]
+        if include_timestamps:
+            yield format_text_with_timestamps(text, record["ts"], state)
+        else:
+            yield text
 
 
 def format_serial_chunk(raw: bytes, fmt: str) -> str:
@@ -138,8 +275,7 @@ def read_loop():
                     with state_lock:
                         fmt = current_format
                     text = format_serial_chunk(raw if fmt == "hex" else data, fmt)
-                    append_chunk(text)
-                    write_to_file(text)
+                    append_record(text, ts=now_ts(), source="serial", include_in_buffer=True)
             except serial.SerialException as e:
                 log_terminal_event("ERROR", f"SerialException: {e}")
                 break
@@ -269,6 +405,11 @@ INDEX_HTML = r"""
       color: var(--term-muted);
       font-style: italic;
     }
+    .log-ts {
+      color: #93c5fd;
+      opacity: 0.85;
+      user-select: none;
+    }
     #terminalStatus {
       margin: 8px 0 12px;
       font-size: 13px;
@@ -310,10 +451,13 @@ INDEX_HTML = r"""
 
     <label><input id="dtrCheckbox" type="checkbox" /> DTR</label>
     <label><input id="rtsCheckbox" type="checkbox" /> RTS</label>
+    <label><input id="showTimestampsCheckbox" type="checkbox" checked /> Pokaż czasy</label>
 
     <button id="startBtn">Start</button>
     <button id="stopBtn">Stop</button>
     <button id="clearBtn">Wyczyść podgląd</button>
+    <button id="downloadLogBtn">Pobierz log</button>
+    <button id="downloadLogWithTsBtn">Pobierz log + czasy</button>
   </div>
 
   <p style="margin-top: 8px; color:#666;">
@@ -334,11 +478,12 @@ let inputInFlight = false;
 let inputFlushTimer = null;
 let statusTimer = null;
 let statusFlash = null;
+let logEntries = [];
+let showTimestamps = true;
 let pendingEscape = "";
 let currentLineEl = null;
 let ansiState = null;
-
-const ANSI_RE = /\x1b\[([0-9;]*)m/g;
+const LOG_BUFFER_MAX = 20000;
 const ANSI_COLORS = [
   "#1f2937", "#ef4444", "#22c55e", "#eab308",
   "#60a5fa", "#c084fc", "#2dd4bf", "#e5e7eb",
@@ -362,6 +507,11 @@ function defaultAnsiState() {
 function initLogPanel() {
   ansiState = defaultAnsiState();
   const log = document.getElementById("log");
+  const showTsCheckbox = document.getElementById("showTimestampsCheckbox");
+  const storedPreference = window.localStorage.getItem("show_timestamps");
+  showTimestamps = storedPreference !== "0";
+  showTsCheckbox.checked = showTimestamps;
+
   log.addEventListener("click", () => log.focus());
   log.addEventListener("focus", () => {
     terminalFocused = true;
@@ -373,6 +523,11 @@ function initLogPanel() {
   });
   log.addEventListener("keydown", handleLogKeydown);
   log.addEventListener("paste", handleLogPaste);
+  showTsCheckbox.addEventListener("change", () => {
+    showTimestamps = showTsCheckbox.checked;
+    window.localStorage.setItem("show_timestamps", showTimestamps ? "1" : "0");
+    rebuildLogView();
+  });
   setLogEmptyState();
   renderTerminalStatus();
 }
@@ -546,10 +701,21 @@ function clearLogEmptyState() {
   }
 }
 
-function ensureCurrentLine() {
+function buildTimestampSpan(ts) {
+  const span = document.createElement("span");
+  span.className = "log-ts";
+  span.dataset.role = "timestamp";
+  span.textContent = `${ts} `;
+  return span;
+}
+
+function ensureCurrentLine(ts = null) {
   if (currentLineEl) return currentLineEl;
   const line = document.createElement("div");
   line.className = "log-line";
+  if (showTimestamps && ts) {
+    line.appendChild(buildTimestampSpan(ts));
+  }
   document.getElementById("log").appendChild(line);
   currentLineEl = line;
   return line;
@@ -568,17 +734,17 @@ function buildStyledSpan(text) {
   return span;
 }
 
-function appendStyledText(text) {
+function appendStyledText(text, ts = null) {
   if (!text) return;
   clearLogEmptyState();
   const span = buildStyledSpan(text);
-  if (span) ensureCurrentLine().appendChild(span);
+  if (span) ensureCurrentLine(ts).appendChild(span);
 }
 
-function appendNewLine() {
+function appendNewLine(ts = null) {
   clearLogEmptyState();
   if (!currentLineEl) {
-    ensureCurrentLine();
+    ensureCurrentLine(ts);
   }
   currentLineEl = null;
 }
@@ -587,6 +753,9 @@ function removeLastRenderedChar() {
   if (!currentLineEl) return;
   while (currentLineEl.lastChild) {
     const node = currentLineEl.lastChild;
+    if (node.dataset && node.dataset.role === "timestamp") {
+      return;
+    }
     if (node.nodeType === Node.TEXT_NODE) {
       if (node.textContent.length > 1) {
         node.textContent = node.textContent.slice(0, -1);
@@ -639,16 +808,17 @@ function consumeEscapeSequence(buffer, startIndex) {
   return {complete: true, nextIndex: startIndex + 2, kind: "ignore"};
 }
 
-function appendChunkToLog(chunk) {
-  let input = pendingEscape + chunk;
+function appendChunkToLog(entry) {
+  let input = pendingEscape + entry.text;
   pendingEscape = "";
   let textStart = 0;
+  const entryTs = entry.ts || null;
 
   for (let i = 0; i < input.length; i++) {
     const ch = input[i];
 
     if (ch === "\x1b") {
-      appendStyledText(input.slice(textStart, i));
+      appendStyledText(input.slice(textStart, i), entryTs);
       const seq = consumeEscapeSequence(input, i);
       if (!seq.complete) {
         pendingEscape = input.slice(i);
@@ -663,41 +833,54 @@ function appendChunkToLog(chunk) {
     }
 
     if (ch === "\r") {
-      appendStyledText(input.slice(textStart, i));
+      appendStyledText(input.slice(textStart, i), entryTs);
       if (input[i + 1] === "\n") {
         i += 1;
       }
-      appendNewLine();
+      appendNewLine(entryTs);
       textStart = i + 1;
       continue;
     }
 
     if (ch === "\n") {
-      appendStyledText(input.slice(textStart, i));
-      appendNewLine();
+      appendStyledText(input.slice(textStart, i), entryTs);
+      appendNewLine(entryTs);
       textStart = i + 1;
       continue;
     }
 
     if (ch === "\b") {
-      appendStyledText(input.slice(textStart, i));
+      appendStyledText(input.slice(textStart, i), entryTs);
       removeLastRenderedChar();
       textStart = i + 1;
     }
   }
 
-  appendStyledText(input.slice(textStart));
+  appendStyledText(input.slice(textStart), entryTs);
 }
 
-function appendToLog(chunks) {
+function appendToLog(entries) {
   const log = document.getElementById("log");
   const atBottom = (log.scrollTop + log.clientHeight) >= (log.scrollHeight - 8);
-  for (const chunk of chunks) {
-    appendChunkToLog(chunk);
+  for (const entry of entries) {
+    appendChunkToLog(entry);
   }
   if (atBottom) {
     log.scrollTop = log.scrollHeight;
   }
+}
+
+function resetLogRenderState() {
+  pendingEscape = "";
+  currentLineEl = null;
+  ansiState = defaultAnsiState();
+}
+
+function rebuildLogView() {
+  document.getElementById("log").replaceChildren();
+  resetLogRenderState();
+  setLogEmptyState();
+  appendToLog(logEntries);
 }
 
 async function pollLog() {
@@ -707,7 +890,16 @@ async function pollLog() {
     const res = await fetch(`/api/log?since=${lastId}`);
     const data = await res.json();
     if (data.chunks && data.chunks.length) {
-      appendToLog(data.chunks.map(x => x.text));
+      const entries = data.chunks.map(x => ({
+        text: x.text,
+        ts: x.ts || null,
+        source: x.source || "serial",
+      }));
+      logEntries.push(...entries);
+      if (logEntries.length > LOG_BUFFER_MAX) {
+        logEntries.splice(0, logEntries.length - LOG_BUFFER_MAX);
+      }
+      appendToLog(entries);
       lastId = data.to_id;
     } else if (typeof data.to_id === "number") {
       lastId = data.to_id;
@@ -852,6 +1044,12 @@ async function flushTerminalInput() {
 document.getElementById("refreshPorts").onclick = fetchPorts;
 document.getElementById("dtrCheckbox").onchange = pushControlLines;
 document.getElementById("rtsCheckbox").onchange = pushControlLines;
+document.getElementById("downloadLogBtn").onclick = () => {
+  window.location.href = "/api/download?timestamps=0";
+};
+document.getElementById("downloadLogWithTsBtn").onclick = () => {
+  window.location.href = "/api/download?timestamps=1";
+};
 
 document.getElementById("startBtn").onclick = async () => {
   const port = document.getElementById("portSelect").value;
@@ -875,12 +1073,9 @@ document.getElementById("stopBtn").onclick = async () => {
 };
 
 document.getElementById("clearBtn").onclick = () => {
-  document.getElementById("log").replaceChildren();
+  logEntries = [];
   lastId = 0;
-  pendingEscape = "";
-  currentLineEl = null;
-  ansiState = defaultAnsiState();
-  setLogEmptyState();
+  rebuildLogView();
 };
 
 (async function init(){
@@ -1020,25 +1215,45 @@ def api_input():
 
 @app.get("/api/log")
 def api_log():
-    # Zwraca fragmenty tekstu o id > since (inkrementalne odświeżanie)
+    # Zwraca rekordy o id > since (inkrementalne odświeżanie)
     try:
         since = int(request.args.get("since", "0"))
     except ValueError:
         since = 0
 
     with state_lock:
-        items = [(i, chunk) for (i, chunk) in ring if i > since]
+        items = [(i, ts, source, text) for (i, ts, source, text) in ring if i > since]
         to_id = ring[-1][0] if ring else since
 
     return jsonify({
         "from_id": since,
         "to_id": to_id,
-        "chunks": [{"id": i, "text": text} for (i, text) in items],
+        "chunks": [
+            {"id": i, "ts": ts, "source": source, "text": text}
+            for (i, ts, source, text) in items
+        ],
     })
 
 
+@app.get("/api/download")
+def api_download():
+    raw_value = request.args.get("timestamps", "1")
+    try:
+        include_timestamps = parse_bool_field(raw_value, "timestamps")
+    except ValueError:
+        include_timestamps = True
+
+    filename = "serial-log-z-czasami.log" if include_timestamps else "serial-log-bez-czasow.log"
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    return Response(
+        stream_with_context(iter_download_text(include_timestamps)),
+        content_type="text/plain; charset=utf-8",
+        headers=headers,
+    )
+
+
 def main():
-    global log_path
+    global log_path, structured_log_path
     parser = argparse.ArgumentParser(description="Serial logger + prosta strona WWW")
     parser.add_argument("--host", default="127.0.0.1", help="adres nasłuchu (np. 0.0.0.0)")
     parser.add_argument("--port", type=int, default=8080, help="port HTTP")
@@ -1046,9 +1261,12 @@ def main():
     args = parser.parse_args()
 
     log_path = args.logfile
+    structured_log_path = f"{log_path}.jsonl"
     log_dir = os.path.dirname(log_path)
     if log_dir:
         os.makedirs(log_dir, exist_ok=True)
+    plain_log_state["at_line_start"] = infer_plain_log_line_start(log_path)
+    bootstrap_structured_log()
     # dopisz informację startową
     log_file_event("INFO", f"Serwer WWW start: http://{args.host}:{args.port}  logfile={log_path}")
 

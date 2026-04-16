@@ -22,6 +22,8 @@ tail -f logs/serial_web.out
 - ustaw `Format` na `string`
 - kliknij w panel logu w przeglądarce
 - wpisywane klawisze są wysyłane na UART
+- `Pokaż czasy` włącza/wyłącza timestampy tylko w widoku WWW
+- log można pobrać z przeglądarki z czasami albo bez
 
 # Structure
 - `src/` - kod aplikacji
