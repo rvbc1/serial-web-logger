@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import re
 import threading
 import uuid
 from collections import deque
@@ -105,6 +106,19 @@ def atomic_write_json(path: str, payload):
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp_path, path)
+
+
+def next_free_session_number_unlocked() -> int:
+    used_numbers = set()
+    for session in sessions.values():
+        match = re.fullmatch(r"Sesja (\d+)", session.name or "")
+        if match:
+            used_numbers.add(int(match.group(1)))
+
+    number = 1
+    while number in used_numbers:
+        number += 1
+    return number
 
 
 class SerialSession:
@@ -450,10 +464,10 @@ def create_session(config: dict | None = None, persist: bool = True) -> SerialSe
             while session_id in sessions:
                 session_id = uuid.uuid4().hex[:8]
         if not name:
-            name = f"Sesja {next_session_number}"
-            next_session_number += 1
+            name = f"Sesja {next_free_session_number_unlocked()}"
         session = SerialSession(session_id, name, config)
         sessions[session_id] = session
+        next_session_number = next_free_session_number_unlocked()
 
     if persist:
         persist_sessions_metadata()
