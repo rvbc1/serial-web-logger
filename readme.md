@@ -21,6 +21,7 @@ tail -f logs/serial_web.out
 # UART terminal
 - jedna karta = jedna niezależna sesja UART
 - można dodawać i usuwać karty z poziomu WWW
+- można nadać każdej karcie własną nazwę, np. `RPi`, `debug UART`, `modem`
 - każda karta ma własny port, baud, format, DTR/RTS, podgląd i plik logu
 - ustaw `Format` na `string`
 - kliknij w panel logu w przeglądarce

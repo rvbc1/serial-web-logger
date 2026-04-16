@@ -315,6 +315,10 @@ class SerialSession:
             if fmt is not None:
                 self.current_format = fmt
 
+    def update_name(self, name: str):
+        with self.state_lock:
+            self.name = name
+
     def write_serial_input(self, text: str):
         with self.state_lock:
             serial_port = self.ser
@@ -568,6 +572,9 @@ INDEX_HTML = r"""
       align-items: center;
       margin-bottom: 16px;
     }
+    .session-name-row {
+      margin-bottom: 12px;
+    }
     #sessionTabs {
       display: flex;
       gap: 10px;
@@ -687,6 +694,13 @@ INDEX_HTML = r"""
     <button id="removeSessionBtn">Usuń sesję</button>
   </div>
 
+  <div class="row session-name-row">
+    <label>Nazwa sesji:
+      <input id="sessionNameInput" type="text" maxlength="80" placeholder="np. RPi UART" />
+    </label>
+    <button id="renameSessionBtn">Zapisz nazwę</button>
+  </div>
+
   <div class="row">
     <span>Status: <span id="statusBadge" class="badge off">STOP</span></span>
     <button id="refreshPorts">Odśwież porty</button>
@@ -775,7 +789,14 @@ function getActiveSummary() {
 
 function ensureSessionCache(sessionId) {
   if (!sessionCaches.has(sessionId)) {
-    sessionCaches.set(sessionId, {lastId: 0, entries: [], draft: null, draftDirty: false});
+    sessionCaches.set(sessionId, {
+      lastId: 0,
+      entries: [],
+      draft: null,
+      draftDirty: false,
+      nameDraft: null,
+      nameDirty: false,
+    });
   }
   return sessionCaches.get(sessionId);
 }
@@ -783,6 +804,37 @@ function ensureSessionCache(sessionId) {
 function getActiveCache() {
   if (!activeSessionId) return null;
   return ensureSessionCache(activeSessionId);
+}
+
+function getSessionNameDraft(sessionId) {
+  if (!sessionId) return "";
+  const cache = ensureSessionCache(sessionId);
+  if (cache.nameDraft === null) {
+    const summary = sessionSummaries.find(session => session.id === sessionId) || null;
+    cache.nameDraft = summary && summary.name ? summary.name : "";
+  }
+  return cache.nameDraft;
+}
+
+function syncSessionNameDraft(status) {
+  const cache = ensureSessionCache(status.id);
+  if (cache.nameDraft === null || !cache.nameDirty) {
+    cache.nameDraft = status.name || "";
+  }
+  return cache.nameDraft || "";
+}
+
+function applySessionNameDraft(name) {
+  document.getElementById("sessionNameInput").value = name || "";
+}
+
+function updateActiveSessionNameDraft(name, options = {}) {
+  if (!activeSessionId) return;
+  const cache = ensureSessionCache(activeSessionId);
+  cache.nameDraft = name;
+  if (options.markDirty !== false) {
+    cache.nameDirty = true;
+  }
 }
 
 function buildDraftFromStatus(status) {
@@ -911,6 +963,8 @@ function setControlsEnabled(enabled) {
   document.getElementById("downloadLogBtn").disabled = !enabled;
   document.getElementById("downloadLogWithTsBtn").disabled = !enabled;
   document.getElementById("removeSessionBtn").disabled = !enabled;
+  document.getElementById("sessionNameInput").disabled = !enabled;
+  document.getElementById("renameSessionBtn").disabled = !enabled;
 }
 
 function flashTerminalStatus(message, variant = "error") {
@@ -1017,7 +1071,9 @@ function applyActiveStatus(status) {
   renderSessionTabs();
   setStatus(status.running);
   const draft = syncDraftFromStatus(status);
+  const nameDraft = syncSessionNameDraft(status);
   applyDraftToControls(draft);
+  applySessionNameDraft(nameDraft);
 }
 
 function setLogEmptyState() {
@@ -1342,6 +1398,7 @@ async function refreshSessionsList(preferredActiveId = null) {
       activeSessionId = null;
       setControlsEnabled(false);
       setStatus(false);
+      applySessionNameDraft("");
       rebuildLogView();
       return;
     }
@@ -1428,6 +1485,7 @@ function initLogPanel() {
   const portSelect = document.getElementById("portSelect");
   const baudInput = document.getElementById("baudInput");
   const formatSelect = document.getElementById("formatSelect");
+  const sessionNameInput = document.getElementById("sessionNameInput");
   const storedPreference = window.localStorage.getItem("show_timestamps");
   showTimestamps = storedPreference !== "0";
   showTsCheckbox.checked = showTimestamps;
@@ -1462,6 +1520,9 @@ function initLogPanel() {
   formatSelect.addEventListener("change", () => {
     updateActiveDraft({format: formatSelect.value});
     scheduleConfigPush();
+  });
+  sessionNameInput.addEventListener("input", () => {
+    updateActiveSessionNameDraft(sessionNameInput.value);
   });
 
   setLogEmptyState();
@@ -1602,6 +1663,44 @@ async function createSession() {
   await refreshSessionsList(data.session ? data.session.id : null);
 }
 
+async function renameActiveSession() {
+  if (!activeSessionId) return;
+
+  const sessionNameInput = document.getElementById("sessionNameInput");
+  const rawName = sessionNameInput.value;
+  const name = rawName.trim();
+  if (!name) {
+    const summary = getActiveSummary();
+    const fallbackName = summary && summary.name ? summary.name : "";
+    const cache = ensureSessionCache(activeSessionId);
+    cache.nameDraft = fallbackName;
+    cache.nameDirty = false;
+    alert("Nazwa sesji nie może być pusta.");
+    applySessionNameDraft(fallbackName);
+    return;
+  }
+
+  updateActiveSessionNameDraft(name, {markDirty: true});
+
+  const res = await fetch(`/api/sessions/${encodeURIComponent(activeSessionId)}/rename`, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({name})
+  });
+  const data = await res.json();
+  if (!res.ok || !data.ok) {
+    alert(data.error || "Nie mogę zmienić nazwy sesji.");
+    return;
+  }
+
+  const cache = ensureSessionCache(activeSessionId);
+  cache.nameDraft = data.status && data.status.name ? data.status.name : name;
+  cache.nameDirty = false;
+  if (data.status) {
+    applyActiveStatus(data.status);
+  }
+}
+
 async function removeActiveSession() {
   const summary = getActiveSummary();
   if (!summary) return;
@@ -1738,11 +1837,17 @@ document.getElementById("dtrCheckbox").onchange = pushControlLines;
 document.getElementById("rtsCheckbox").onchange = pushControlLines;
 document.getElementById("addSessionBtn").onclick = createSession;
 document.getElementById("removeSessionBtn").onclick = removeActiveSession;
+document.getElementById("renameSessionBtn").onclick = renameActiveSession;
 document.getElementById("startBtn").onclick = startActiveSession;
 document.getElementById("stopBtn").onclick = stopActiveSession;
 document.getElementById("clearBtn").onclick = clearActivePreview;
 document.getElementById("downloadLogBtn").onclick = () => downloadActiveLog(false);
 document.getElementById("downloadLogWithTsBtn").onclick = () => downloadActiveLog(true);
+document.getElementById("sessionNameInput").addEventListener("keydown", (event) => {
+  if (event.key !== "Enter") return;
+  event.preventDefault();
+  renameActiveSession();
+});
 
 (async function init() {
   initLogPanel();
@@ -1832,6 +1937,28 @@ def api_session_config(session_id: str):
             return jsonify({"ok": False, "error": "Nieprawidłowy format (string/hex)."}), 400
 
     session.update_config(port=port, baud=baud, fmt=fmt)
+    persist_sessions_metadata()
+    return jsonify({"ok": True, "status": session.status_payload()})
+
+
+@app.post("/api/sessions/<session_id>/rename")
+def api_session_rename(session_id: str):
+    session, error = session_from_request(session_id)
+    if error:
+        return error
+
+    data = request.get_json(force=True, silent=True) or {}
+    name = data.get("name")
+    if not isinstance(name, str):
+        return jsonify({"ok": False, "error": "Pole name musi być typu string."}), 400
+
+    name = name.strip()
+    if not name:
+        return jsonify({"ok": False, "error": "Nazwa sesji nie może być pusta."}), 400
+    if len(name) > 80:
+        return jsonify({"ok": False, "error": "Nazwa sesji jest za długa (max 80 znaków)."}), 400
+
+    session.update_name(name)
     persist_sessions_metadata()
     return jsonify({"ok": True, "status": session.status_payload()})
 
