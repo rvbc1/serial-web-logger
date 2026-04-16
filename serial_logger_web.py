@@ -22,6 +22,8 @@ current_port = None
 current_baud = None
 log_path = None
 current_format = "string"
+desired_dtr = True
+desired_rts = True
 
 # Przechowujemy ostatnie N wpisów do podglądu w WWW (plik rośnie normalnie na dysku)
 RING_MAX = 5000
@@ -54,6 +56,43 @@ def write_to_file(line: str):
     with open(log_path, "a", encoding="utf-8", errors="replace") as f:
         f.write(line + "\n")
         f.flush()
+
+
+def format_signal_state(value: bool) -> str:
+    return "ON" if value else "OFF"
+
+
+def parse_bool_field(value, field_name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in ("1", "true", "on", "yes"):
+            return True
+        if normalized in ("0", "false", "off", "no"):
+            return False
+    raise ValueError(f"Pole {field_name} musi być typu bool.")
+
+
+def apply_control_lines(serial_port, dtr_state: bool, rts_state: bool):
+    serial_port.dtr = dtr_state
+    serial_port.rts = rts_state
+
+
+def update_control_lines(dtr_state: bool, rts_state: bool):
+    global desired_dtr, desired_rts
+
+    with state_lock:
+        serial_port = ser
+
+    if serial_port is not None:
+        apply_control_lines(serial_port, dtr_state, rts_state)
+
+    with state_lock:
+        desired_dtr = dtr_state
+        desired_rts = rts_state
 
 
 def read_loop():
@@ -92,7 +131,7 @@ def read_loop():
         write_to_file(f"{now_ts()} [INFO] Stop czytania")
 
 
-def start_listening(port: str, baud: int):
+def start_listening(port: str, baud: int, dtr_state: bool, rts_state: bool):
     global reader_thread, ser, current_port, current_baud
 
     with state_lock:
@@ -105,13 +144,27 @@ def start_listening(port: str, baud: int):
     current_baud = int(baud)
 
     try:
-        ser = serial.Serial(
-            port=current_port,
-            baudrate=current_baud,
-            timeout=0.5,   # żeby wątek mógł reagować na stop_event
-        )
+        new_ser = serial.Serial()
+        new_ser.port = current_port
+        new_ser.baudrate = current_baud
+        new_ser.timeout = 0.5  # żeby wątek mógł reagować na stop_event
+        new_ser.rtscts = False
+        new_ser.dsrdtr = False
+        new_ser.dtr = dtr_state
+        new_ser.rts = rts_state
+        new_ser.open()
+        ser = new_ser
     except Exception as e:
         return False, f"Nie mogę otworzyć {port}: {e}"
+
+    append_line(
+        f"{now_ts()} [INFO] Port otwarty: {current_port} @ {current_baud} "
+        f"DTR={format_signal_state(dtr_state)} RTS={format_signal_state(rts_state)}"
+    )
+    write_to_file(
+        f"{now_ts()} [INFO] Port otwarty: {current_port} @ {current_baud} "
+        f"DTR={format_signal_state(dtr_state)} RTS={format_signal_state(rts_state)}"
+    )
 
     reader_thread = threading.Thread(target=read_loop, daemon=True)
     reader_thread.start()
@@ -186,6 +239,9 @@ INDEX_HTML = r"""
       </select>
     </label>
 
+    <label><input id="dtrCheckbox" type="checkbox" checked /> DTR</label>
+    <label><input id="rtsCheckbox" type="checkbox" checked /> RTS</label>
+
     <button id="startBtn">Start</button>
     <button id="stopBtn">Stop</button>
     <button id="clearBtn">Wyczyść podgląd</button>
@@ -236,6 +292,8 @@ async function fetchStatus() {
   if (data.port) document.getElementById("portSelect").value = data.port;
   if (data.baud) document.getElementById("baudInput").value = data.baud;
   if (data.format) document.getElementById("formatSelect").value = data.format;
+  document.getElementById("dtrCheckbox").checked = !!data.dtr;
+  document.getElementById("rtsCheckbox").checked = !!data.rts;
 }
 
 function appendToLog(lines) {
@@ -266,16 +324,37 @@ function stopPolling() {
   if (polling) { clearInterval(polling); polling = null; }
 }
 
+async function pushControlLines() {
+  const dtr = document.getElementById("dtrCheckbox").checked;
+  const rts = document.getElementById("rtsCheckbox").checked;
+  const res = await fetch("/api/control-lines", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({dtr, rts})
+  });
+  const data = await res.json();
+  if (!res.ok || !data.ok) {
+    await fetchStatus();
+    alert(data.error || "Błąd ustawiania DTR/RTS");
+    return;
+  }
+  setStatus(data.running);
+}
+
 document.getElementById("refreshPorts").onclick = fetchPorts;
+document.getElementById("dtrCheckbox").onchange = pushControlLines;
+document.getElementById("rtsCheckbox").onchange = pushControlLines;
 
 document.getElementById("startBtn").onclick = async () => {
   const port = document.getElementById("portSelect").value;
   const baud = parseInt(document.getElementById("baudInput").value, 10);
   const format = document.getElementById("formatSelect").value;
+  const dtr = document.getElementById("dtrCheckbox").checked;
+  const rts = document.getElementById("rtsCheckbox").checked;
   const res = await fetch("/api/start", {
     method: "POST",
     headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({port, baud, format})
+    body: JSON.stringify({port, baud, format, dtr, rts})
   });
   const data = await res.json();
   if (!data.ok) alert(data.error || "Błąd startu");
@@ -317,22 +396,37 @@ def api_ports():
 
 @app.get("/api/status")
 def api_status():
+    with state_lock:
+        running = reader_thread is not None and reader_thread.is_alive()
+        port = current_port
+        baud = current_baud
+        logfile = log_path
+        fmt = current_format
+        dtr = desired_dtr
+        rts = desired_rts
+
     return jsonify({
-        "running": is_running(),
-        "port": current_port,
-        "baud": current_baud,
-        "logfile": log_path,
-        "format": current_format,
+        "running": running,
+        "port": port,
+        "baud": baud,
+        "logfile": logfile,
+        "format": fmt,
+        "dtr": dtr,
+        "rts": rts,
     })
 
 
 @app.post("/api/start")
 def api_start():
-    global current_format
+    global current_format, desired_dtr, desired_rts
     data = request.get_json(force=True, silent=True) or {}
     port = (data.get("port") or "").strip()
     baud = data.get("baud", 115200)
     fmt = (data.get("format") or "string").strip().lower()
+
+    with state_lock:
+        current_dtr = desired_dtr
+        current_rts = desired_rts
 
     if fmt not in ("string", "hex"):
         return jsonify({"ok": False, "error": "Nieprawidłowy format (string/hex)."}), 400
@@ -340,10 +434,18 @@ def api_start():
     if not port:
         return jsonify({"ok": False, "error": "Nie wybrano portu."}), 400
 
+    try:
+        dtr_state = parse_bool_field(data.get("dtr", current_dtr), "dtr")
+        rts_state = parse_bool_field(data.get("rts", current_rts), "rts")
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
     with state_lock:
         current_format = fmt
+        desired_dtr = dtr_state
+        desired_rts = rts_state
 
-    ok, msg = start_listening(port, int(baud))
+    ok, msg = start_listening(port, int(baud), dtr_state, rts_state)
     if not ok:
         return jsonify({"ok": False, "error": msg}), 500
     return jsonify({"ok": True})
@@ -353,6 +455,39 @@ def api_start():
 def api_stop():
     stop_listening()
     return jsonify({"ok": True})
+
+
+@app.post("/api/control-lines")
+def api_control_lines():
+    data = request.get_json(force=True, silent=True) or {}
+
+    try:
+        dtr_state = parse_bool_field(data.get("dtr"), "dtr")
+        rts_state = parse_bool_field(data.get("rts"), "rts")
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+    try:
+        update_control_lines(dtr_state, rts_state)
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"Nie mogę ustawić DTR/RTS: {e}"}), 500
+
+    target = "na otwartym porcie" if is_running() else "dla następnego otwarcia portu"
+    append_line(
+        f"{now_ts()} [INFO] Ustawiono DTR={format_signal_state(dtr_state)} "
+        f"RTS={format_signal_state(rts_state)} {target}"
+    )
+    write_to_file(
+        f"{now_ts()} [INFO] Ustawiono DTR={format_signal_state(dtr_state)} "
+        f"RTS={format_signal_state(rts_state)} {target}"
+    )
+
+    return jsonify({
+        "ok": True,
+        "running": is_running(),
+        "dtr": dtr_state,
+        "rts": rts_state,
+    })
 
 
 @app.get("/api/log")
