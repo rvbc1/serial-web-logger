@@ -332,6 +332,17 @@ class SerialSession:
         with self.state_lock:
             self.name = name
 
+    def clear_history(self):
+        with self.log_io_lock:
+            with self.state_lock:
+                self.ring.clear()
+                self.next_id = 1
+                self.plain_log_state = {"at_line_start": True}
+
+            os.makedirs(os.path.dirname(self.log_path) or ".", exist_ok=True)
+            open(self.log_path, "w", encoding="utf-8").close()
+            open(self.structured_log_path, "w", encoding="utf-8").close()
+
     def write_serial_input(self, text: str):
         with self.state_lock:
             serial_port = self.ser
@@ -758,6 +769,7 @@ INDEX_HTML = r"""
   <div class="row" style="margin-top: 12px;">
     <button id="downloadLogBtn">Pobierz log</button>
     <button id="downloadLogWithTsBtn">Pobierz log + czasy</button>
+    <button id="clearLogBtn">Skasuj log</button>
   </div>
 
 <script>
@@ -984,6 +996,7 @@ function setControlsEnabled(enabled) {
   document.getElementById("clearBtn").disabled = !enabled;
   document.getElementById("downloadLogBtn").disabled = !enabled;
   document.getElementById("downloadLogWithTsBtn").disabled = !enabled;
+  document.getElementById("clearLogBtn").disabled = !enabled;
   document.getElementById("removeSessionBtn").disabled = !enabled;
   document.getElementById("sessionNameInput").disabled = !enabled;
   document.getElementById("renameSessionBtn").disabled = !enabled;
@@ -1848,6 +1861,31 @@ function clearActivePreview() {
   rebuildLogView();
 }
 
+async function clearActiveLogHistory() {
+  const summary = getActiveSummary();
+  if (!summary) return;
+
+  const ok = window.confirm(`Skasować cały log sesji "${summary.name}"?`);
+  if (!ok) return;
+
+  const res = await fetch(`/api/sessions/${encodeURIComponent(summary.id)}/clear-log`, {
+    method: "POST"
+  });
+  const data = await res.json();
+  if (!res.ok || !data.ok) {
+    alert(data.error || "Nie mogę skasować logu.");
+    return;
+  }
+
+  const cache = ensureSessionCache(summary.id);
+  cache.entries = [];
+  cache.lastId = 0;
+  rebuildLogView();
+  if (data.status) {
+    applyActiveStatus(data.status);
+  }
+}
+
 function downloadActiveLog(includeTimestamps) {
   if (!activeSessionId) return;
   const flag = includeTimestamps ? "1" : "0";
@@ -1865,6 +1903,7 @@ document.getElementById("stopBtn").onclick = stopActiveSession;
 document.getElementById("clearBtn").onclick = clearActivePreview;
 document.getElementById("downloadLogBtn").onclick = () => downloadActiveLog(false);
 document.getElementById("downloadLogWithTsBtn").onclick = () => downloadActiveLog(true);
+document.getElementById("clearLogBtn").onclick = clearActiveLogHistory;
 document.getElementById("sessionNameInput").addEventListener("keydown", (event) => {
   if (event.key !== "Enter") return;
   event.preventDefault();
@@ -1982,6 +2021,20 @@ def api_session_rename(session_id: str):
 
     session.update_name(name)
     persist_sessions_metadata()
+    return jsonify({"ok": True, "status": session.status_payload()})
+
+
+@app.post("/api/sessions/<session_id>/clear-log")
+def api_session_clear_log(session_id: str):
+    session, error = session_from_request(session_id)
+    if error:
+        return error
+
+    try:
+        session.clear_history()
+    except OSError as exc:
+        return jsonify({"ok": False, "error": f"Nie mogę skasować logu: {exc}"}), 500
+
     return jsonify({"ok": True, "status": session.status_payload()})
 
 
